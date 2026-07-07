@@ -212,10 +212,13 @@
             if (autoCaptureCooldown || !scanner || video.readyState < 2) return;
 
             const vw = video.videoWidth, vh = video.videoHeight;
-            if (!vw || !vh) return;
+            const cw = video.clientWidth, ch = video.clientHeight;
+            if (!vw || !vh || !cw || !ch) return;
 
-            const scale = DETECT_WIDTH / vw;
-            const dw = DETECT_WIDTH, dh = Math.round(vh * scale);
+            // 検出用canvasは「画面に表示されている縦横比」に合わせる。
+            // videoは既定でobject-fit:fillのため、表示時に元映像の縦横比と非等方に伸縮されている。
+            // 検出用canvasも同じ比率で描画しないと、検出した座標を表示サイズへスケールする際にズレる。
+            const dw = DETECT_WIDTH, dh = Math.round(DETECT_WIDTH * (ch / cw));
             detectCanvas.width = dw;
             detectCanvas.height = dh;
             detectCanvas.getContext('2d').drawImage(video, 0, 0, dw, dh);
