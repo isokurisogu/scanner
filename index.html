@@ -25,6 +25,7 @@
         }
         .guide-frame.aligned { border-color: #2ecc71; box-shadow: 0 0 0 999px rgba(46, 204, 113, 0.15); }
         #guideText { color: #333; font-weight: bold; min-height: 1.2em; }
+        #overlayCanvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
     </style>
 </head>
 <body>
@@ -38,6 +39,7 @@
         <div class="video-wrap">
             <video id="video" width="400" height="300" autoplay playsinline muted></video>
             <div id="guideFrame" class="guide-frame"></div>
+            <canvas id="overlayCanvas"></canvas>
         </div>
     </div>
 
@@ -55,6 +57,8 @@
         const resultContainer = document.getElementById('resultContainer');
         const guideFrame = document.getElementById('guideFrame');
         const guideText = document.getElementById('guideText');
+        const overlayCanvas = document.getElementById('overlayCanvas');
+        const overlayCtx = overlayCanvas.getContext('2d');
         let scanner;
 
         // 自動撮影の判定用パラメータ
@@ -162,6 +166,32 @@
             guideFrame.classList.toggle('aligned', aligned);
         }
 
+        // 検出した書類の角を線でつないでオーバーレイ表示する
+        function drawCorners(scaled, aligned) {
+            overlayCanvas.width = video.clientWidth;
+            overlayCanvas.height = video.clientHeight;
+            overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+            const pts = [scaled.tl, scaled.tr, scaled.br, scaled.bl];
+            overlayCtx.strokeStyle = aligned ? '#2ecc71' : '#ff5252';
+            overlayCtx.lineWidth = 3;
+            overlayCtx.beginPath();
+            pts.forEach((p, i) => (i === 0 ? overlayCtx.moveTo(p.x, p.y) : overlayCtx.lineTo(p.x, p.y)));
+            overlayCtx.closePath();
+            overlayCtx.stroke();
+
+            overlayCtx.fillStyle = aligned ? '#2ecc71' : '#ff5252';
+            pts.forEach((p) => {
+                overlayCtx.beginPath();
+                overlayCtx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+                overlayCtx.fill();
+            });
+        }
+
+        function clearCorners() {
+            overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        }
+
         // 検出ループを開始する（ビデオのメタデータ読み込み後に一度だけ呼ばれる）
         function startDetectionLoop() {
             if (pollTimer) return;
@@ -189,6 +219,7 @@
 
                 if (!contour) {
                     resetStability();
+                    clearCorners();
                     setGuideMessage("📐 プリントを枠内に合わせてください", false);
                     return;
                 }
@@ -211,6 +242,8 @@
                     p.x >= rect.x - GUIDE_MARGIN_PX && p.x <= rect.x + rect.w + GUIDE_MARGIN_PX &&
                     p.y >= rect.y - GUIDE_MARGIN_PX && p.y <= rect.y + rect.h + GUIDE_MARGIN_PX
                 );
+
+                drawCorners(scaled, withinGuide);
 
                 if (!withinGuide) {
                     resetStability();
