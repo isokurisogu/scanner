@@ -26,6 +26,9 @@
         .guide-frame.aligned { border-color: #2ecc71; box-shadow: 0 0 0 999px rgba(46, 204, 113, 0.15); }
         #guideText { color: #333; font-weight: bold; min-height: 1.2em; }
         #overlayCanvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; box-shadow: none; }
+        #manualCanvas { touch-action: none; cursor: crosshair; }
+        #manualBox { display: none; }
+        #manualHint { color: #666; font-size: 14px; }
     </style>
 </head>
 <body>
@@ -45,8 +48,16 @@
 
     <button id="snapBtn" disabled>📸 この位置で写真を撮る！</button>
 
+    <div class="box" id="manualBox">
+        <h3>2. うまく切り抜けなかった場合は角をドラッグして調整してね</h3>
+        <p id="manualHint">📍 四隅の点を書類の角に合わせてください</p>
+        <canvas id="manualCanvas"></canvas>
+        <br>
+        <button id="applyManualBtn">✂️ この位置で切り抜く</button>
+    </div>
+
     <div class="box">
-        <h3>2. 補正後の写真（トリミング・台形補正済）</h3>
+        <h3>3. 補正後の写真（トリミング・台形補正済）</h3>
         <div id="resultContainer"></div>
     </div>
 
@@ -59,7 +70,18 @@
         const guideText = document.getElementById('guideText');
         const overlayCanvas = document.getElementById('overlayCanvas');
         const overlayCtx = overlayCanvas.getContext('2d');
+        const manualBox = document.getElementById('manualBox');
+        const manualCanvas = document.getElementById('manualCanvas');
+        const manualCtx = manualCanvas.getContext('2d');
+        const applyManualBtn = document.getElementById('applyManualBtn');
         let scanner;
+
+        // 手動トリミング調整用の状態
+        const HANDLE_RADIUS = 14;
+        let rawCaptureCanvas = null; // 撮影時のフル解像度canvas
+        let manualScale = 1;         // manualCanvas表示サイズ ÷ rawCaptureCanvasサイズ
+        let manualPoints = null;     // manualCanvas表示座標系での四隅 {tl,tr,bl,br}
+        let draggingCorner = null;
 
         // 自動撮影の判定用パラメータ
         const DETECT_WIDTH = 640;      // 検出処理用に縮小する幅(px)
@@ -138,22 +160,158 @@
             captureCanvas.width = video.videoWidth;
             captureCanvas.height = video.videoHeight;
             captureCanvas.getContext('2d').drawImage(video, 0, 0);
+            rawCaptureCanvas = captureCanvas;
+
+            // コーナー座標を自分で取得しておく（手動調整UIの初期位置に使うため）
+            let detectedCorners = null;
+            let mat = null, contour = null;
+            try {
+                mat = cv.imread(captureCanvas);
+                contour = scanner.findPaperContour(mat);
+                if (contour) detectedCorners = scanner.getCornerPoints(contour);
+            } catch (e) {
+                // 検出に失敗しても手動調整で対応できるので無視する
+            } finally {
+                if (contour) contour.delete();
+                if (mat) mat.delete();
+            }
+
+            // 手動調整UIを、検出できていればその位置、できていなければ標準的な内側の矩形で表示する
+            showManualAdjust(captureCanvas, detectedCorners);
+
+            if (!detectedCorners) {
+                status.innerText = "❌ 紙を検出できませんでした。下の枠を手動で調整して「この位置で切り抜く」を押してね";
+                return;
+            }
 
             // 💡 ここが心臓部！撮影したフレームから書類を切り出し、横600×縦800に真っ直ぐ補正する
-            const resultCanvas = scanner.extractPaper(captureCanvas, 600, 800);
+            const resultCanvas = scanner.extractPaper(captureCanvas, 600, 800, detectedCorners);
 
             if (!resultCanvas) {
-                status.innerText = "❌ 紙を検出できませんでした。角度や明るさを変えて試してね";
+                status.innerText = "❌ 紙を検出できませんでした。下の枠を手動で調整して「この位置で切り抜く」を押してね";
                 return;
             }
 
             // 画面にできあがった画像を追加する
             resultContainer.appendChild(resultCanvas);
-            status.innerText = auto ? "✅ 自動撮影しました！" : "✅ 綺麗に補正されました！";
+            status.innerText = (auto ? "✅ 自動撮影しました！" : "✅ 綺麗に補正されました！") + " うまく切り抜けていなければ下で手動調整できます";
         }
 
         // ボタンが押されたら手動で撮影する
         snapBtn.addEventListener('click', () => capturePhoto({ auto: false }));
+
+        // 手動トリミング調整UIを表示する。cornersがnullなら標準的な内側矩形を初期値にする
+        function showManualAdjust(rawCanvas, corners) {
+            const displayWidth = Math.min(400, rawCanvas.width);
+            const scale = displayWidth / rawCanvas.width;
+            manualCanvas.width = displayWidth;
+            manualCanvas.height = Math.round(rawCanvas.height * scale);
+            manualScale = scale;
+
+            const base = corners || {
+                topLeftCorner: { x: rawCanvas.width * 0.1, y: rawCanvas.height * 0.1 },
+                topRightCorner: { x: rawCanvas.width * 0.9, y: rawCanvas.height * 0.1 },
+                bottomLeftCorner: { x: rawCanvas.width * 0.1, y: rawCanvas.height * 0.9 },
+                bottomRightCorner: { x: rawCanvas.width * 0.9, y: rawCanvas.height * 0.9 },
+            };
+            manualPoints = {
+                tl: { x: base.topLeftCorner.x * scale, y: base.topLeftCorner.y * scale },
+                tr: { x: base.topRightCorner.x * scale, y: base.topRightCorner.y * scale },
+                bl: { x: base.bottomLeftCorner.x * scale, y: base.bottomLeftCorner.y * scale },
+                br: { x: base.bottomRightCorner.x * scale, y: base.bottomRightCorner.y * scale },
+            };
+
+            manualBox.style.display = 'block';
+            drawManual();
+        }
+
+        // 手動調整canvasに撮影画像＋ドラッグ可能な四隅を描画する
+        function drawManual() {
+            manualCtx.clearRect(0, 0, manualCanvas.width, manualCanvas.height);
+            manualCtx.drawImage(rawCaptureCanvas, 0, 0, manualCanvas.width, manualCanvas.height);
+
+            const pts = [manualPoints.tl, manualPoints.tr, manualPoints.br, manualPoints.bl];
+            manualCtx.strokeStyle = '#007bff';
+            manualCtx.lineWidth = 3;
+            manualCtx.beginPath();
+            pts.forEach((p, i) => (i === 0 ? manualCtx.moveTo(p.x, p.y) : manualCtx.lineTo(p.x, p.y)));
+            manualCtx.closePath();
+            manualCtx.stroke();
+
+            manualCtx.fillStyle = '#007bff';
+            pts.forEach((p) => {
+                manualCtx.beginPath();
+                manualCtx.arc(p.x, p.y, HANDLE_RADIUS, 0, Math.PI * 2);
+                manualCtx.fill();
+            });
+        }
+
+        // manualCanvas上のポインタ座標を、canvasの描画座標系(width/height基準)に変換する
+        function getManualPoint(evt) {
+            const rect = manualCanvas.getBoundingClientRect();
+            const scaleX = manualCanvas.width / rect.width;
+            const scaleY = manualCanvas.height / rect.height;
+            return {
+                x: (evt.clientX - rect.left) * scaleX,
+                y: (evt.clientY - rect.top) * scaleY,
+            };
+        }
+
+        manualCanvas.addEventListener('pointerdown', (evt) => {
+            if (!manualPoints) return;
+            const p = getManualPoint(evt);
+            let closestKey = null;
+            let closestDist = Infinity;
+            for (const key of ['tl', 'tr', 'bl', 'br']) {
+                const d = Math.hypot(p.x - manualPoints[key].x, p.y - manualPoints[key].y);
+                if (d < closestDist) {
+                    closestDist = d;
+                    closestKey = key;
+                }
+            }
+            if (closestDist <= HANDLE_RADIUS * 2.5) {
+                draggingCorner = closestKey;
+                manualCanvas.setPointerCapture(evt.pointerId);
+            }
+        });
+
+        manualCanvas.addEventListener('pointermove', (evt) => {
+            if (!draggingCorner) return;
+            const p = getManualPoint(evt);
+            manualPoints[draggingCorner] = {
+                x: Math.max(0, Math.min(manualCanvas.width, p.x)),
+                y: Math.max(0, Math.min(manualCanvas.height, p.y)),
+            };
+            drawManual();
+        });
+
+        function endManualDrag() {
+            draggingCorner = null;
+        }
+        manualCanvas.addEventListener('pointerup', endManualDrag);
+        manualCanvas.addEventListener('pointercancel', endManualDrag);
+
+        // 手動で調整した四隅を使って切り抜きをやり直す
+        applyManualBtn.addEventListener('click', () => {
+            if (!rawCaptureCanvas || !manualPoints) return;
+
+            const s = manualScale;
+            const cornerPoints = {
+                topLeftCorner: { x: manualPoints.tl.x / s, y: manualPoints.tl.y / s },
+                topRightCorner: { x: manualPoints.tr.x / s, y: manualPoints.tr.y / s },
+                bottomLeftCorner: { x: manualPoints.bl.x / s, y: manualPoints.bl.y / s },
+                bottomRightCorner: { x: manualPoints.br.x / s, y: manualPoints.br.y / s },
+            };
+
+            const resultCanvas = scanner.extractPaper(rawCaptureCanvas, 600, 800, cornerPoints);
+            resultContainer.innerHTML = '';
+            if (!resultCanvas) {
+                status.innerText = "❌ 切り抜きに失敗しました。角の位置を調整してもう一度試してね";
+                return;
+            }
+            resultContainer.appendChild(resultCanvas);
+            status.innerText = "✅ 手動トリミングを適用しました！";
+        });
 
         // ガイド枠のピクセル座標（video要素の表示サイズに対する割合から算出）
         function getGuideRectPx() {
