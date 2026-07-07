@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>マイ・jscanify・スキャナー</title>
+    <script src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.1/dist/opencv.js" async onerror="window.__opencvLoadFailed = true"></script>
+    <script src="https://cdn.jsdelivr.net/gh/ColonelParrot/jscanify@master/src/jscanify.min.js"></script>
+    <style>
+        body { font-family: sans-serif; text-align: center; background: #f0f2f5; padding: 20px; }
+        video, canvas { max-width: 100%; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); background: #000; }
+        button { padding: 12px 24px; font-size: 16px; border: none; background: #007bff; color: white; border-radius: 20px; cursor: pointer; margin: 15px 0; font-weight: bold; }
+        button:disabled { background: #ccc; }
+        .box { margin-bottom: 25px; }
+        h3 { color: #333; margin-bottom: 5px; }
+        .video-wrap { position: relative; display: inline-block; max-width: 100%; }
+        .guide-frame {
+            position: absolute;
+            left: 10%; top: 15%; width: 80%; height: 70%;
+            border: 3px dashed rgba(255, 255, 255, 0.85);
+            border-radius: 8px;
+            box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.25);
+            pointer-events: none;
+            transition: border-color 0.2s;
+        }
+        .guide-frame.aligned { border-color: #2ecc71; box-shadow: 0 0 0 999px rgba(46, 204, 113, 0.15); }
+        #guideText { color: #333; font-weight: bold; min-height: 1.2em; }
+    </style>
+</head>
+<body>
+
+    <h2>📄 jscanify 撮影テストアプリ</h2>
+    <p id="status">⏳ ライブラリを読み込み中...</p>
+
+    <div class="box">
+        <h3>1. カメラ映像（プリントを写してね）</h3>
+        <p id="guideText">📐 この枠内にプリントを合わせてください</p>
+        <div class="video-wrap">
+            <video id="video" width="400" height="300" autoplay playsinline muted></video>
+            <div id="guideFrame" class="guide-frame"></div>
+        </div>
+    </div>
+
+    <button id="snapBtn" disabled>📸 この位置で写真を撮る！</button>
+
+    <div class="box">
+        <h3>2. 補正後の写真（トリミング・台形補正済）</h3>
+        <div id="resultContainer"></div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const snapBtn = document.getElementById('snapBtn');
+        const status = document.getElementById('status');
+        const resultContainer = document.getElementById('resultContainer');
+        const guideFrame = document.getElementById('guideFrame');
+        const guideText = document.getElementById('guideText');
+        let scanner;
+
+        // 自動撮影の判定用パラメータ
+        const DETECT_WIDTH = 320;      // 検出処理用に縮小する幅(px)
+        const POLL_INTERVAL_MS = 280;  // 検出ポーリング間隔
+        const REQUIRED_STABLE_FRAMES = 5; // これだけ連続で静止していたら自動撮影
+        const MOVE_THRESHOLD_PX = 8;   // 「静止」とみなす1フレームあたりの平均移動量
+        const GUIDE_MARGIN_PX = 10;    // 枠判定の許容マージン
+        const AUTO_CAPTURE_COOLDOWN_MS = 3000; // 自動撮影後、再開までの待ち時間
+
+        const detectCanvas = document.createElement('canvas');
+        let pollTimer = null;
+        let stableCount = 0;
+        let lastCorners = null;
+        let autoCaptureCooldown = false;
+
+        // opencv.jsはasync読み込みなので、グローバル変数cvが定義されるまで待ってから
+        // onRuntimeInitializedコールバックを登録する
+        const openCvWaitStartedAt = Date.now();
+        function waitForOpenCv() {
+            if (window.__opencvLoadFailed) {
+                status.innerText = "❌ opencv.jsの読み込みに失敗しました（通信環境を確認して再読み込みしてください）";
+                return;
+            }
+            if (typeof cv === 'undefined') {
+                if (Date.now() - openCvWaitStartedAt > 20000) {
+                    status.innerText = "❌ opencv.jsの読み込みがタイムアウトしました（回線が遅いか、ブロックされています。再読み込みしてください）";
+                    return;
+                }
+                setTimeout(waitForOpenCv, 100);
+                return;
+            }
+            cv['onRuntimeInitialized'] = () => {
+                scanner = new jscanify();
+                status.innerText = "✅ 準備完了！教科書やプリントに向けてボタンを押してね";
+                snapBtn.disabled = false;
+                startCamera();
+            };
+        }
+        waitForOpenCv();
+
+        // カメラを起動する
+        function startCamera() {
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+                .then((stream) => {
+                    video.srcObject = stream;
+                    video.addEventListener('loadedmetadata', startDetectionLoop, { once: true });
+                })
+                .catch((err) => {
+                    status.innerText = "❌ カメラの起動に失敗しました: " + err;
+                });
+        }
+
+        // 写真を撮ってjscanifyで加工する（手動ボタン・自動撮影の共通処理）
+        function capturePhoto({ auto } = { auto: false }) {
+            // 表示されている古い結果を消す
+            resultContainer.innerHTML = '';
+
+            if (video.readyState < 2) {
+                status.innerText = "⏳ カメラ映像がまだ準備できていません。少し待ってから押してね";
+                return;
+            }
+
+            status.innerText = "⚡ 補正処理中...";
+
+            // 現在のビデオフレームを一旦canvasに描画してからjscanifyに渡す
+            const captureCanvas = document.createElement('canvas');
+            captureCanvas.width = video.videoWidth;
+            captureCanvas.height = video.videoHeight;
+            captureCanvas.getContext('2d').drawImage(video, 0, 0);
+
+            // 💡 ここが心臓部！撮影したフレームから書類を切り出し、横600×縦800に真っ直ぐ補正する
+            const resultCanvas = scanner.extractPaper(captureCanvas, 600, 800);
+
+            if (!resultCanvas) {
+                status.innerText = "❌ 紙を検出できませんでした。角度や明るさを変えて試してね";
+                return;
+            }
+
+            // 画面にできあがった画像を追加する
+            resultContainer.appendChild(resultCanvas);
+            status.innerText = auto ? "✅ 自動撮影しました！" : "✅ 綺麗に補正されました！";
+        }
+
+        // ボタンが押されたら手動で撮影する
+        snapBtn.addEventListener('click', () => capturePhoto({ auto: false }));
+
+        // ガイド枠のピクセル座標（video要素の表示サイズに対する割合から算出）
+        function getGuideRectPx() {
+            return {
+                x: video.clientWidth * 0.10,
+                y: video.clientHeight * 0.15,
+                w: video.clientWidth * 0.80,
+                h: video.clientHeight * 0.70,
+            };
+        }
+
+        function resetStability() {
+            stableCount = 0;
+            lastCorners = null;
+        }
+
+        function setGuideMessage(text, aligned) {
+            guideText.innerText = text;
+            guideFrame.classList.toggle('aligned', aligned);
+        }
+
+        // 検出ループを開始する（ビデオのメタデータ読み込み後に一度だけ呼ばれる）
+        function startDetectionLoop() {
+            if (pollTimer) return;
+            pollTimer = setInterval(pollFrame, POLL_INTERVAL_MS);
+        }
+
+        // 1フレーム分の紙検出＆アライメント判定を行う
+        function pollFrame() {
+            if (autoCaptureCooldown || !scanner || video.readyState < 2) return;
+
+            const vw = video.videoWidth, vh = video.videoHeight;
+            if (!vw || !vh) return;
+
+            const scale = DETECT_WIDTH / vw;
+            const dw = DETECT_WIDTH, dh = Math.round(vh * scale);
+            detectCanvas.width = dw;
+            detectCanvas.height = dh;
+            detectCanvas.getContext('2d').drawImage(video, 0, 0, dw, dh);
+
+            let mat = null;
+            let contour = null;
+            try {
+                mat = cv.imread(detectCanvas);
+                contour = scanner.findPaperContour(mat);
+
+                if (!contour) {
+                    resetStability();
+                    setGuideMessage("📐 プリントを枠内に合わせてください", false);
+                    return;
+                }
+
+                const corners = scanner.getCornerPoints(contour);
+
+                // 検出用に縮小した座標を、実際のvideo表示サイズに合わせてスケールアップ
+                const sx = video.clientWidth / dw;
+                const sy = video.clientHeight / dh;
+                const scaled = {
+                    tl: { x: corners.topLeftCorner.x * sx, y: corners.topLeftCorner.y * sy },
+                    tr: { x: corners.topRightCorner.x * sx, y: corners.topRightCorner.y * sy },
+                    bl: { x: corners.bottomLeftCorner.x * sx, y: corners.bottomLeftCorner.y * sy },
+                    br: { x: corners.bottomRightCorner.x * sx, y: corners.bottomRightCorner.y * sy },
+                };
+
+                const rect = getGuideRectPx();
+                const points = [scaled.tl, scaled.tr, scaled.bl, scaled.br];
+                const withinGuide = points.every((p) =>
+                    p.x >= rect.x - GUIDE_MARGIN_PX && p.x <= rect.x + rect.w + GUIDE_MARGIN_PX &&
+                    p.y >= rect.y - GUIDE_MARGIN_PX && p.y <= rect.y + rect.h + GUIDE_MARGIN_PX
+                );
+
+                if (!withinGuide) {
+                    resetStability();
+                    setGuideMessage("📐 プリントを枠内に合わせてください", false);
+                    return;
+                }
+
+                // フレーム間の移動量を見て「静止」しているか判定する
+                let avgMove = Infinity;
+                if (lastCorners) {
+                    avgMove = (
+                        Math.hypot(scaled.tl.x - lastCorners.tl.x, scaled.tl.y - lastCorners.tl.y) +
+                        Math.hypot(scaled.tr.x - lastCorners.tr.x, scaled.tr.y - lastCorners.tr.y) +
+                        Math.hypot(scaled.bl.x - lastCorners.bl.x, scaled.bl.y - lastCorners.bl.y) +
+                        Math.hypot(scaled.br.x - lastCorners.br.x, scaled.br.y - lastCorners.br.y)
+                    ) / 4;
+                }
+                lastCorners = scaled;
+
+                if (avgMove > MOVE_THRESHOLD_PX) {
+                    stableCount = 1;
+                    setGuideMessage("✅ 枠内OK！そのまま動かさないでください…", true);
+                    return;
+                }
+
+                stableCount++;
+                setGuideMessage(`✅ 静止中… (${stableCount}/${REQUIRED_STABLE_FRAMES})`, true);
+
+                if (stableCount >= REQUIRED_STABLE_FRAMES) {
+                    triggerAutoCapture();
+                }
+            } catch (e) {
+                // 検出処理中の一時的なエラーは無視して次のフレームで再試行する
+            } finally {
+                if (contour) contour.delete();
+                if (mat) mat.delete();
+            }
+        }
+
+        function triggerAutoCapture() {
+            autoCaptureCooldown = true;
+            resetStability();
+            setGuideMessage("📸 自動撮影中...", true);
+            capturePhoto({ auto: true });
+            setTimeout(() => {
+                autoCaptureCooldown = false;
+                setGuideMessage("📐 この枠内にプリントを合わせてください", false);
+            }, AUTO_CAPTURE_COOLDOWN_MS);
+        }
+    </script>
+</body>
+</html>
