@@ -60,14 +60,14 @@
         // 自動撮影の判定用パラメータ
         const DETECT_WIDTH = 320;      // 検出処理用に縮小する幅(px)
         const POLL_INTERVAL_MS = 280;  // 検出ポーリング間隔
-        const REQUIRED_STABLE_FRAMES = 5; // これだけ連続で静止していたら自動撮影
+        const REQUIRED_STABLE_MS = 500; // これだけ静止し続けたら自動撮影
         const MOVE_THRESHOLD_PX = 8;   // 「静止」とみなす1フレームあたりの平均移動量
         const GUIDE_MARGIN_PX = 10;    // 枠判定の許容マージン
         const AUTO_CAPTURE_COOLDOWN_MS = 3000; // 自動撮影後、再開までの待ち時間
 
         const detectCanvas = document.createElement('canvas');
         let pollTimer = null;
-        let stableCount = 0;
+        let stableSince = null;
         let lastCorners = null;
         let autoCaptureCooldown = false;
 
@@ -153,7 +153,7 @@
         }
 
         function resetStability() {
-            stableCount = 0;
+            stableSince = null;
             lastCorners = null;
         }
 
@@ -231,15 +231,16 @@
                 lastCorners = scaled;
 
                 if (avgMove > MOVE_THRESHOLD_PX) {
-                    stableCount = 1;
+                    stableSince = Date.now();
                     setGuideMessage("✅ 枠内OK！そのまま動かさないでください…", true);
                     return;
                 }
 
-                stableCount++;
-                setGuideMessage(`✅ 静止中… (${stableCount}/${REQUIRED_STABLE_FRAMES})`, true);
+                if (!stableSince) stableSince = Date.now();
+                const stableMs = Date.now() - stableSince;
+                setGuideMessage(`✅ 静止中… (${(stableMs / 1000).toFixed(1)}s / ${(REQUIRED_STABLE_MS / 1000).toFixed(1)}s)`, true);
 
-                if (stableCount >= REQUIRED_STABLE_FRAMES) {
+                if (stableMs >= REQUIRED_STABLE_MS) {
                     triggerAutoCapture();
                 }
             } catch (e) {
