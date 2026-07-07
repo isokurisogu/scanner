@@ -13,7 +13,7 @@
         button:disabled { background: #ccc; }
         .box { margin-bottom: 25px; }
         h3 { color: #333; margin-bottom: 5px; }
-        .video-wrap { position: relative; display: inline-block; max-width: 100%; }
+        .video-wrap { position: relative; display: inline-block; max-width: 100%; overflow: hidden; border-radius: 8px; }
         .guide-frame {
             position: absolute;
             left: 20%; top: 5%; width: 60%; height: 90%;
@@ -111,6 +111,10 @@
                         overlayCanvas.height = video.clientHeight;
                         startDetectionLoop();
                     }, { once: true });
+                    // 環境によってはautoplay属性だけでは再生が始まらないため明示的に再生する
+                    video.play().catch((err) => {
+                        status.innerText = "❌ カメラ映像の再生に失敗しました: " + err;
+                    });
                 })
                 .catch((err) => {
                     status.innerText = "❌ カメラの起動に失敗しました: " + err;
